@@ -1,8 +1,4 @@
 import {
-  Flex,
-  Grid,
-  GridItem,
-  Icon,
   Modal,
   ModalBody,
   ModalCloseButton,
@@ -10,16 +6,14 @@ import {
   ModalHeader,
   ModalOverlay,
   useMediaQuery,
+  useToast,
 } from "@chakra-ui/react";
-import { ListWallets, WalletsConfig } from "@src/configs/web3/wallets";
-import { useConnectWallet } from "@src/hooks/useConnectWallet";
 import { useWeb3React } from "@src/hooks/useWeb3React";
-import { useState } from "react";
-import { isMobile } from "react-device-detect";
-import { useSwitchNetwork } from "wagmi";
-import WalletItem from "./WalletItem";
-
-
+import { useState, useEffect } from "react";
+import { getWallets } from '@/configs/web3/wallets';
+import { Wallet } from '@/configs/web3/types';
+import LedgerSubprovider from '@ledgerhq/web3-subprovider';
+import TrezorConnect from '@trezor/connect-web';
 
 interface IWalletModal {
   isOpen?: boolean;
@@ -31,59 +25,144 @@ const WalletModal: React.FC<IWalletModal> = ({
   onDismiss = () => null,
 }) => {
   const { chainId } = useWeb3React();
-  const { login } = useConnectWallet();
-  const { switchNetwork } = useSwitchNetwork();
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [wallets, setWallets] = useState<Wallet[]>([]);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isSmallThan480] = useMediaQuery("(max-width: 480px)", { ssr: true });
+  const toast = useToast();
 
-  const handleConnectWallet = async (wallet: WalletsConfig): Promise<void> => {
+  useEffect(() => {
+    setWallets(getWallets());
+  }, []);
+
+  //check hardware wallet connection
+  const checkHardwareWalletConnection = async (walletId: string): Promise<boolean> => {
     try {
-      if (!wallet?.installed) {
-        window.open(
-          isMobile
-            ? wallet?.downloadLink?.mobile
-            : wallet?.downloadLink?.desktop,
-          "_blank"
-        );
-        return;
-      }
-      switchNetwork &&  await switchNetwork(chainId);
-      setTimeout(() => {
+      if (walletId === 'ledger') {
+        const devices = await navigator.usb?.getDevices();
+        return devices && devices.length > 0;
+      } else if (walletId === 'trezor') {
         try {
-          const web3Modal = document.getElementsByTagName("w3m-modal");
-          if (web3Modal) {
-            // @ts-ignore
-            const root = web3Modal[0].shadowRoot;
-            if (root) {
-              const modal = root.children[0];
-              if (modal) {
-                // @ts-ignore
-                modal.style.zIndex = "999999";
-              }
+          await TrezorConnect.init({
+            connectSrc: 'https://connect.trezor.io/9/',
+            lazyLoad: true,
+            manifest: {
+              email: 'developer@example.com',
+              appUrl: typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000'
             }
-          }
-        } catch (e) {
-          /* empty */
+          });
+          
+          const result = await TrezorConnect.getFeatures({
+            device: {
+              path: '1'
+            }
+          });
+          
+          return !result.error && !!result.payload;
+        } catch (err) {
+          console.error('Trezor check failed:', err);
+          return false;
+        } finally {
+          await TrezorConnect.dispose();
         }
-      }, 500);
-      await login(wallet?.connectorId, chainId);
-      localStorage.setItem("wallet", wallet?.connectorId);
-      onDismiss();
-    } catch (e) {
-      /* empty */
+      }
+      return false;
+    } catch (err) {
+      console.error('Failed to check wallet connection:', err);
+      return false;
     }
   };
 
-  const sortedWallets = ListWallets.sort(
-    (a, b) => a.priority - b.priority
-  ).sort((a, b) => Number(b.installed) - Number(a.installed));
+  //connect hardware wallet
+  const connectHardwareWallet = async (wallet: Wallet) => {
+    setIsConnecting(true);
+    setError(null);
+    
+    try {
+      const isConnected = await checkHardwareWalletConnection(wallet.id);
+      
+      if (!isConnected) {
+        toast({
+          title: "Hardware wallet not detected",
+          description: `Please make sure your ${wallet.title} is connected and unlocked.`,
+          status: "warning",
+          duration: 5000,
+          isClosable: true,
+          position: "top"
+        });
+        return;
+      }
 
-  const [isSmallThan480] = useMediaQuery("(max-width: 480px)", { ssr: true });
+      if (wallet.id === 'ledger') {
+        const ledger = new LedgerSubprovider({
+          networkId: chainId || 1,
+          accountsLength: 5
+        });
+        await ledger.init();
+        toast({
+          title: "Success",
+          description: "Ledger wallet connected successfully",
+          status: "success",
+          duration: 3000,
+          isClosable: true,
+          position: "top"
+        });
+        onDismiss();
+      } else if (wallet.id === 'trezor') {
+        try {
+          await TrezorConnect.init({
+            connectSrc: 'https://connect.trezor.io/9/',
+            lazyLoad: true,
+            manifest: {
+              email: 'developer@example.com',
+              appUrl: typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000'
+            }
+          });
+
+          const response = await TrezorConnect.ethereumGetAddress({
+            path: "m/44'/60'/0'/0/0",
+            showOnTrezor: true
+          });
+
+          if (response.success) {
+            toast({
+              title: "Success",
+              description: "Trezor wallet connected successfully",
+              status: "success",
+              duration: 3000,
+              isClosable: true,
+              position: "top"
+            });
+            onDismiss();
+          } else {
+            throw new Error(response.payload.error);
+          }
+        } catch (err: any) {
+          throw new Error(`Failed to connect Trezor: ${err.message}`);
+        }
+      }
+    } catch (err: any) {
+      const errorMessage = err.message || 'Failed to connect wallet';
+      setError(errorMessage);
+      toast({
+        title: "Connection Error",
+        description: errorMessage,
+        status: "error",
+        duration: 5000,
+        isClosable: true,
+        position: "top"
+      });
+      console.error('Failed to connect wallet:', err);
+    } finally {
+      setIsConnecting(false);
+    }
+  };
 
   return (
     <Modal isOpen={isOpen} onClose={onDismiss} isCentered={!isSmallThan480}>
       <ModalOverlay />
-      <ModalContent className={"p-4"}>
-        <ModalHeader className={"mt-2 text-center"}>Connect wallet</ModalHeader>
+      <ModalContent className="p-4">
+        <ModalHeader className="mt-2 text-center">Connect Hardware Wallet</ModalHeader>
         <ModalCloseButton onClick={onDismiss} />
         <ModalBody
           px={{
@@ -91,46 +170,38 @@ const WalletModal: React.FC<IWalletModal> = ({
             lg: 6,
           }}
         >
-          <Grid className={"w-full gap-3"} templateColumns="repeat(2, 1fr)">
-            {sortedWallets.slice(0, isExpanded ? 20 : 4).map((wallet) => (
-              <GridItem key={wallet.title}>
-                <WalletItem
-                  walletConfig={wallet}
-                  handleLogin={handleConnectWallet}
-                />
-              </GridItem>
+          {error && (
+            <div className="error-message mb-4 text-red-500 text-center">
+              {error}
+            </div>
+          )}
+          
+          <div className="wallet-list space-y-4">
+            {wallets.map((wallet) => (
+              <button
+                key={wallet.id}
+                className="wallet-button w-full p-4 flex items-center justify-center border rounded-lg hover:bg-gray-50 relative"
+                onClick={() => connectHardwareWallet(wallet)}
+                disabled={isConnecting}
+              >
+                <span className="text-center">{wallet.title}</span>
+                {isConnecting && (
+                  <span className="loading-spinner absolute right-4">
+                    Loading...
+                  </span>
+                )}
+              </button>
             ))}
-          </Grid>
-          <Flex
-            className={
-              "prose-md prose mt-4 w-full cursor-pointer items-center justify-center gap-2 font-medium text-[#898F9C]"
-            }
-            onClick={() => setIsExpanded(!isExpanded)}
-          >
-            {isExpanded ? "Less" : "More"}
-            <Icon
-              viewBox="0 0 15 14"
-              className={`transition duration-150 ease-in-out ${
-                isExpanded ? "rotate-180" : ""
-              }`}
-            >
-              <path
-                d="M11.5837 5.83331L7.50033 9.91665L3.41699 5.83331"
-                stroke="#898F9C"
-                fill={"none"}
-                stroke-width="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </Icon>
-          </Flex>
-          <button
-            className={
-              "mt-4 h-[40px] w-full rounded-3xl bg-primary-03 text-sm font-bold text-white"
-            }
-          >
-            Learn how to connect wallet
-          </button>
+          </div>
+          
+          <div className="mt-4 text-sm text-gray-500">
+            <p>Make sure your hardware wallet is:</p>
+            <ul className="list-disc pl-5 mt-2">
+              <li>Connected to your computer</li>
+              <li>Unlocked</li>
+              <li>Running the latest firmware</li>
+            </ul>
+          </div>
         </ModalBody>
       </ModalContent>
     </Modal>
